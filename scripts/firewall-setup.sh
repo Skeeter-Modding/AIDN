@@ -34,6 +34,50 @@ check_root() {
     fi
 }
 
+validate_ip() {
+    local ip="$1"
+
+    if [[ -z "$ip" ]]; then
+        return 1
+    fi
+
+    # IPv4 validation
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if (( octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+
+    # IPv6 validation (simplified - accepts common formats)
+    if [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || \
+       [[ "$ip" =~ ^::([0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$ ]] || \
+       [[ "$ip" =~ ^[0-9a-fA-F]{1,4}::$ ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+validate_port() {
+    local port="$1"
+
+    if [[ -z "$port" ]]; then
+        return 1
+    fi
+
+    # Check if it's a valid port number (1-65535)
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+        return 0
+    fi
+
+    return 1
+}
+
 install_dependencies() {
     log_info "Installing iptables and dependencies..."
     apt-get update -qq
@@ -302,12 +346,39 @@ main() {
             interactive_setup
             ;;
         allow-ip)
+            if [[ -z "$2" ]]; then
+                log_error "IP address required"
+                echo "Usage: $0 allow-ip IP [COMMENT]"
+                exit 1
+            fi
+            if ! validate_ip "$2"; then
+                log_error "Invalid IP address: $2"
+                exit 1
+            fi
             cmd_allow_ip "$2" "$3"
             ;;
         block-ip)
+            if [[ -z "$2" ]]; then
+                log_error "IP address required"
+                echo "Usage: $0 block-ip IP [COMMENT]"
+                exit 1
+            fi
+            if ! validate_ip "$2"; then
+                log_error "Invalid IP address: $2"
+                exit 1
+            fi
             cmd_block_ip "$2" "$3"
             ;;
         allow-port)
+            if [[ -z "$2" ]]; then
+                log_error "Port number required"
+                echo "Usage: $0 allow-port PORT [SOURCE] [PROTOCOL]"
+                exit 1
+            fi
+            if ! validate_port "$2"; then
+                log_error "Invalid port number: $2 (must be 1-65535)"
+                exit 1
+            fi
             cmd_allow_port "$2" "$3" "$4"
             ;;
         show)
