@@ -89,6 +89,33 @@ check_root() {
     fi
 }
 
+validate_ip() {
+    local ip="$1"
+
+    if [[ -z "$ip" ]]; then
+        return 1
+    fi
+
+    # IPv4 validation
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS='.'
+        read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if (( octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+
+    # IPv6 validation (simplified - accepts common formats)
+    if [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || \
+       [[ "$ip" =~ ^::([0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$ ]] || \
+       [[ "$ip" =~ ^[0-9a-fA-F]{1,4}::$ ]]; then
+        return 0
+    fi
+
+    return 1
 check_fail2ban_installed() {
     if ! command -v fail2ban-client &> /dev/null; then
         log_error "fail2ban is not installed. Run '$0 setup' first."
@@ -128,8 +155,8 @@ banaction_allports = iptables-allports
 # Ignore localhost
 ignoreip = 127.0.0.1/8 ::1
 
-# Backend
-backend = systemd
+# Backend - auto detects systemd journal or log files
+backend = auto
 
 #
 # SSH Jail
@@ -138,7 +165,6 @@ backend = systemd
 enabled = true
 port = ${ssh_port}
 filter = sshd
-logpath = /var/log/auth.log
 maxretry = 3
 bantime = 3600
 findtime = 600
@@ -150,7 +176,6 @@ findtime = 600
 enabled = true
 port = ${ssh_port}
 filter = sshd-ddos
-logpath = /var/log/auth.log
 maxretry = 5
 bantime = 86400
 findtime = 300
@@ -175,14 +200,25 @@ create_sshd_ddos_filter() {
 
     cat > "$F2B_FILTER_DIR/sshd-ddos.conf" << 'EOF'
 # AIDN - SSH DDoS Filter
-# Detects connection flooding
+# Detects authentication abuse and connection flooding
 
 [Definition]
-failregex = ^.*sshd.*: Connection from <HOST>.*$
-            ^.*sshd.*: Received disconnect from <HOST>.*\[preauth\]$
-            ^.*sshd.*: Disconnected from <HOST>.*\[preauth\]$
+# Match real abuse signals - authentication failures and invalid users
+failregex = ^.*sshd\[\d+\]: Failed password for .* from <HOST>.*$
+            ^.*sshd\[\d+\]: Failed password for invalid user .* from <HOST>.*$
+            ^.*sshd\[\d+\]: Invalid user .* from <HOST>.*$
+            ^.*sshd\[\d+\]: User .* from <HOST> not allowed because.*$
+            ^.*sshd\[\d+\]: error: PAM: Authentication failure for .* from <HOST>.*$
+            ^.*sshd\[\d+\]: Received disconnect from <HOST>.*: .* \[preauth\]$
+            ^.*sshd\[\d+\]: Disconnected from authenticating user .* <HOST>.*\[preauth\]$
+            ^.*sshd\[\d+\]: Connection reset by <HOST>.*\[preauth\]$
+            ^.*sshd\[\d+\]: Unable to negotiate with <HOST>.*$
+            ^.*sshd\[\d+\]: Bad protocol version identification.*from <HOST>.*$
 
-ignoreregex =
+# Ignore legitimate successful connections
+ignoreregex = ^.*sshd\[\d+\]: Accepted (password|publickey) for .* from <HOST>.*$
+              ^.*sshd\[\d+\]: Connection closed by authenticating user .* <HOST>.*$
+              ^.*sshd\[\d+\]: pam_unix\(sshd:session\): session opened for user.*$
 EOF
 
     log_info "SSH DDoS filter created"
@@ -458,6 +494,28 @@ main() {
             show_status
             ;;
         ban)
+            if [[ -z "$2" ]]; then
+                log_error "IP address required"
+                echo "Usage: $0 ban IP [JAIL]"
+                exit 1
+            fi
+            if ! validate_ip "$2"; then
+                log_error "Invalid IP address: $2"
+                exit 1
+            fi
+            ban_ip "$2" "${3:-sshd}"
+            ;;
+        unban)
+            if [[ -z "$2" ]]; then
+                log_error "IP address required"
+                echo "Usage: $0 unban IP [JAIL]"
+                exit 1
+            fi
+            if ! validate_ip "$2"; then
+                log_error "Invalid IP address: $2"
+                exit 1
+            fi
+            unban_ip "$2" "${3:-}"
             check_fail2ban_installed
             if ! ban_ip "$2" "${3:-sshd}"; then
                 exit 1
