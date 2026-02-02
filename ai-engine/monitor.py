@@ -114,13 +114,13 @@ class StatsCollector:
         """Determine current attack level"""
         pps = self.stats.packets_per_second
 
-        if pps > 10000000:  # 10M pps
+        if pps >= 10000000:  # 10M pps
             return "critical"
-        elif pps > 1000000:  # 1M pps
+        elif pps >= 1000000:  # 1M pps
             return "high"
-        elif pps > 100000:  # 100K pps
+        elif pps >= 100000:  # 100K pps
             return "medium"
-        elif pps > 10000:  # 10K pps
+        elif pps >= 10000:  # 10K pps
             return "low"
         return "none"
 

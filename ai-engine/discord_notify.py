@@ -175,16 +175,29 @@ class DiscordNotifier:
         # Build embeds
         embeds = []
         for notif in notifications:
+            # Truncate to Discord API limits
+            title = notif.title[:256] if len(notif.title) > 256 else notif.title
+            description = notif.description[:4096] if len(notif.description) > 4096 else notif.description
+            footer_text = (notif.footer or f"AIDN • {self.server_name}")[:2048]
+
             embed = {
-                "title": notif.title,
-                "description": notif.description,
+                "title": title,
+                "description": description,
                 "color": notif.color,
                 "timestamp": notif.timestamp.isoformat(),
-                "footer": {"text": notif.footer or f"AIDN • {self.server_name}"}
+                "footer": {"text": footer_text}
             }
 
             if notif.fields:
-                embed["fields"] = notif.fields
+                # Truncate field values to Discord limits
+                truncated_fields = []
+                for field in notif.fields[:25]:  # Max 25 fields
+                    truncated_fields.append({
+                        "name": str(field.get("name", ""))[:256],
+                        "value": str(field.get("value", ""))[:1024],
+                        "inline": field.get("inline", False)
+                    })
+                embed["fields"] = truncated_fields
 
             if notif.thumbnail_url:
                 embed["thumbnail"] = {"url": notif.thumbnail_url}
