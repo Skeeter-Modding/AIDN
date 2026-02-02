@@ -1,0 +1,138 @@
+# =============================================================================
+# AIDN - Example Docker Compose for Arma Reforger with DDoS Protection
+# =============================================================================
+# This is a template - adjust paths, ports, and settings for your setup
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Arma Reforger Game Server
+  # ---------------------------------------------------------------------------
+  arma-reforger:
+    image: ${ARMA_IMAGE:-arma-reforger-server:latest}
+    container_name: arma-reforger-server
+    restart: unless-stopped
+
+    # Network mode: host gives best performance for game servers
+    # but requires firewall rules on host
+    network_mode: host
+
+    # Or use bridge mode with port mapping (less performant but more isolated):
+    # networks:
+    #   - gameserver_net
+    # ports:
+    #   - "2001:2001/udp"      # Game port
+    #   - "17777:17777/udp"    # Steam query
+    #   - "19999:19999/tcp"    # RCON
+
+    volumes:
+      - ./config:/config:ro
+      - ./profiles:/profiles
+      - ./mods:/mods:ro
+      - arma_logs:/logs
+
+    environment:
+      - SERVER_NAME=${SERVER_NAME:-My Arma Reforger Server}
+      - SERVER_PASSWORD=${SERVER_PASSWORD:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme}
+      - MAX_PLAYERS=${MAX_PLAYERS:-64}
+      - GAME_PORT=${GAME_PORT:-2001}
+      - STEAM_QUERY_PORT=${STEAM_QUERY_PORT:-17777}
+      - RCON_PORT=${RCON_PORT:-19999}
+
+    # Resource limits prevent runaway processes
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "nc", "-zu", "localhost", "2001"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Log Aggregator (for fail2ban to read Docker logs)
+  # ---------------------------------------------------------------------------
+  log-aggregator:
+    image: alpine:latest
+    container_name: log-aggregator
+    restart: unless-stopped
+    command: >
+      sh -c "
+        mkdir -p /var/log/arma-reforger &&
+        tail -F /docker-logs/*/*.log |
+        while read line; do
+          echo \"\$line\" >> /var/log/arma-reforger/combined.log
+        done
+      "
+    volumes:
+      - /var/lib/docker/containers:/docker-logs:ro
+      - /var/log/arma-reforger:/var/log/arma-reforger
+
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 64M
+
+  # ---------------------------------------------------------------------------
+  # Prometheus Node Exporter (optional - for monitoring)
+  # ---------------------------------------------------------------------------
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    network_mode: host
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+      - '--web.listen-address=127.0.0.1:9100'
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  gameserver_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  arma_logs:
+    driver: local
