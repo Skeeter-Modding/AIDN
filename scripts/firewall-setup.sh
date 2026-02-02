@@ -45,50 +45,15 @@ trap cleanup EXIT
 # Input validation functions
 validate_ip() {
     local ip="$1"
-    # Match IPv4 address with optional CIDR notation
-    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
-        log_error "Invalid IP address: $ip"
-        return 1
-    fi
-    # Validate each octet is 0-255
-    local IFS='.'
-    read -ra octets <<< "${ip%%/*}"
-    for octet in "${octets[@]}"; do
-        if [[ "$octet" -gt 255 ]]; then
-            log_error "Invalid IP address: $ip (octet $octet > 255)"
-            return 1
-        fi
-    done
-    return 0
-}
-
-validate_port() {
-    local port="$1"
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
-        log_error "Invalid port number: $port (must be 1-65535)"
-        return 1
-    fi
-    return 0
-}
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
-        exit 1
-    fi
-}
-
-validate_ip() {
-    local ip="$1"
 
     if [[ -z "$ip" ]]; then
         return 1
     fi
 
-    # IPv4 validation
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    # IPv4 validation (with optional CIDR)
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
         local IFS='.'
-        read -ra octets <<< "$ip"
+        read -ra octets <<< "${ip%%/*}"
         for octet in "${octets[@]}"; do
             if (( octet > 255 )); then
                 return 1
@@ -120,6 +85,13 @@ validate_port() {
     fi
 
     return 1
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        exit 1
+    fi
 }
 
 install_dependencies() {

@@ -47,30 +47,46 @@ trap cleanup EXIT
 # Input validation functions
 validate_ip() {
     local ip="$1"
-    # Match IPv4 address with optional CIDR notation
-    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
-        log_error "Invalid IP address: $ip"
+
+    if [[ -z "$ip" ]]; then
         return 1
     fi
-    # Validate each octet is 0-255
-    local IFS='.'
-    read -ra octets <<< "${ip%%/*}"
-    for octet in "${octets[@]}"; do
-        if [[ "$octet" -gt 255 ]]; then
-            log_error "Invalid IP address: $ip (octet $octet > 255)"
-            return 1
-        fi
-    done
-    return 0
+
+    # IPv4 validation (with optional CIDR)
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        local IFS='.'
+        read -ra octets <<< "${ip%%/*}"
+        for octet in "${octets[@]}"; do
+            if (( octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+
+    # IPv6 validation (simplified - accepts common formats)
+    if [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || \
+       [[ "$ip" =~ ^::([0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$ ]] || \
+       [[ "$ip" =~ ^[0-9a-fA-F]{1,4}::$ ]]; then
+        return 0
+    fi
+
+    return 1
 }
 
 validate_port() {
     local port="$1"
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
-        log_error "Invalid port number: $port (must be 1-65535)"
+
+    if [[ -z "$port" ]]; then
         return 1
     fi
-    return 0
+
+    # Check if it's a valid port number (1-65535)
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+        return 0
+    fi
+
+    return 1
 }
 
 validate_jail() {
@@ -89,33 +105,6 @@ check_root() {
     fi
 }
 
-validate_ip() {
-    local ip="$1"
-
-    if [[ -z "$ip" ]]; then
-        return 1
-    fi
-
-    # IPv4 validation
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        local IFS='.'
-        read -ra octets <<< "$ip"
-        for octet in "${octets[@]}"; do
-            if (( octet > 255 )); then
-                return 1
-            fi
-        done
-        return 0
-    fi
-
-    # IPv6 validation (simplified - accepts common formats)
-    if [[ "$ip" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || \
-       [[ "$ip" =~ ^::([0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$ ]] || \
-       [[ "$ip" =~ ^[0-9a-fA-F]{1,4}::$ ]]; then
-        return 0
-    fi
-
-    return 1
 check_fail2ban_installed() {
     if ! command -v fail2ban-client &> /dev/null; then
         log_error "fail2ban is not installed. Run '$0 setup' first."
@@ -494,6 +483,7 @@ main() {
             show_status
             ;;
         ban)
+            check_fail2ban_installed
             if [[ -z "$2" ]]; then
                 log_error "IP address required"
                 echo "Usage: $0 ban IP [JAIL]"
@@ -503,9 +493,12 @@ main() {
                 log_error "Invalid IP address: $2"
                 exit 1
             fi
-            ban_ip "$2" "${3:-sshd}"
+            if ! ban_ip "$2" "${3:-sshd}"; then
+                exit 1
+            fi
             ;;
         unban)
+            check_fail2ban_installed
             if [[ -z "$2" ]]; then
                 log_error "IP address required"
                 echo "Usage: $0 unban IP [JAIL]"
@@ -515,15 +508,7 @@ main() {
                 log_error "Invalid IP address: $2"
                 exit 1
             fi
-            unban_ip "$2" "${3:-}"
-            check_fail2ban_installed
-            if ! ban_ip "$2" "${3:-sshd}"; then
-                exit 1
-            fi
-            ;;
-        unban)
-            check_fail2ban_installed
-            if ! unban_ip "$2" "$3"; then
+            if ! unban_ip "$2" "${3:-}"; then
                 exit 1
             fi
             ;;
