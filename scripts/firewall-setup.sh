@@ -15,6 +15,10 @@ NC='\033[0m'
 # Configuration file
 AIDN_CONFIG="/etc/aidn/firewall.conf"
 
+# Track if we're in setup mode for cleanup
+SETUP_IN_PROGRESS=false
+
+# Logging functions (defined early for use in cleanup)
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -25,6 +29,46 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Cleanup handler for unexpected exits during setup
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]] && [[ "$SETUP_IN_PROGRESS" == "true" ]]; then
+        log_error "Setup failed with exit code $exit_code"
+        log_warn "Firewall may be in an inconsistent state!"
+        log_warn "Run 'iptables -F && iptables -P INPUT ACCEPT' to reset if needed"
+    fi
+}
+trap cleanup EXIT
+
+# Input validation functions
+validate_ip() {
+    local ip="$1"
+    # Match IPv4 address with optional CIDR notation
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        log_error "Invalid IP address: $ip"
+        return 1
+    fi
+    # Validate each octet is 0-255
+    local IFS='.'
+    read -ra octets <<< "${ip%%/*}"
+    for octet in "${octets[@]}"; do
+        if [[ "$octet" -gt 255 ]]; then
+            log_error "Invalid IP address: $ip (octet $octet > 255)"
+            return 1
+        fi
+    done
+    return 0
+}
+
+validate_port() {
+    local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        log_error "Invalid port number: $port (must be 1-65535)"
+        return 1
+    fi
+    return 0
 }
 
 check_root() {
@@ -90,55 +134,134 @@ create_config_dir() {
 }
 
 load_config() {
+    # Default values
+    SSH_PORT="10022"
+    ADMIN_IP=""
+    GAME_PORTS=""
+
     if [[ -f "$AIDN_CONFIG" ]]; then
-        source "$AIDN_CONFIG"
+        # Safely parse config file instead of sourcing it (security fix)
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^#.*$ ]] && continue
+            [[ -z "$key" ]] && continue
+
+            # Remove quotes from value
+            value="${value#\"}"
+            value="${value%\"}"
+
+            case "$key" in
+                SSH_PORT)
+                    if validate_port "$value" 2>/dev/null; then
+                        SSH_PORT="$value"
+                    fi
+                    ;;
+                ADMIN_IP)
+                    if validate_ip "$value" 2>/dev/null; then
+                        ADMIN_IP="$value"
+                    fi
+                    ;;
+                GAME_PORTS)
+                    GAME_PORTS="$value"
+                    ;;
+            esac
+        done < "$AIDN_CONFIG"
         log_info "Loaded configuration from $AIDN_CONFIG"
     else
         log_warn "No configuration found, using defaults"
-        # Defaults
-        SSH_PORT="10022"
-        ADMIN_IPS=""
-        GAME_PORTS=""
     fi
 }
 
 flush_rules() {
     log_info "Flushing existing firewall rules..."
+    # IPv4
     iptables -F
-    iptables -X
+    iptables -X 2>/dev/null || true
     iptables -t nat -F
-    iptables -t nat -X
+    iptables -t nat -X 2>/dev/null || true
     iptables -t mangle -F
-    iptables -t mangle -X
+    iptables -t mangle -X 2>/dev/null || true
+
+    # IPv6
+    ip6tables -F
+    ip6tables -X 2>/dev/null || true
+    ip6tables -t nat -F 2>/dev/null || true
+    ip6tables -t nat -X 2>/dev/null || true
+    ip6tables -t mangle -F
+    ip6tables -t mangle -X 2>/dev/null || true
 }
 
 set_default_policies() {
     log_info "Setting default DROP policies..."
+    # IPv4
     iptables -P INPUT DROP
     iptables -P FORWARD DROP
     iptables -P OUTPUT ACCEPT
+
+    # IPv6
+    ip6tables -P INPUT DROP
+    ip6tables -P FORWARD DROP
+    ip6tables -P OUTPUT ACCEPT
 }
 
 setup_loopback() {
     log_info "Allowing loopback interface..."
+    # IPv4
     iptables -A INPUT -i lo -j ACCEPT
     iptables -A OUTPUT -o lo -j ACCEPT
+
+    # IPv6
+    ip6tables -A INPUT -i lo -j ACCEPT
+    ip6tables -A OUTPUT -o lo -j ACCEPT
 }
 
 setup_established() {
     log_info "Allowing established connections..."
+    # IPv4
     iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # IPv6
+    ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    # Allow ICMPv6 for neighbor discovery (required for IPv6)
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type neighbor-solicitation -j ACCEPT
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type neighbor-advertisement -j ACCEPT
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type router-solicitation -j ACCEPT
+    ip6tables -A INPUT -p icmpv6 --icmpv6-type router-advertisement -j ACCEPT
 }
 
 allow_ssh() {
     local port="${1:-10022}"
+
+    if ! validate_port "$port"; then
+        return 1
+    fi
+
+    # Check if rule already exists (idempotency)
+    if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+        log_info "SSH on port $port already allowed (skipping)"
+        return 0
+    fi
+
     log_info "Allowing SSH on port $port..."
     iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+    ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT
 }
 
 allow_admin_ip() {
     local ip="$1"
     local comment="${2:-Admin}"
+
+    if ! validate_ip "$ip"; then
+        return 1
+    fi
+
+    # Check if rule already exists (idempotency)
+    if iptables -C INPUT -s "$ip" -j ACCEPT 2>/dev/null; then
+        log_info "IP $ip already allowed (skipping)"
+        return 0
+    fi
+
     log_info "Allowing full access from $ip ($comment)..."
     iptables -A INPUT -s "$ip" -m comment --comment "$comment" -j ACCEPT
 }
@@ -148,11 +271,27 @@ allow_port_tcp() {
     local source="${2:-0.0.0.0/0}"
     local comment="${3:-}"
 
+    if ! validate_port "$port"; then
+        return 1
+    fi
+
+    # Check if rule already exists (idempotency)
+    if iptables -C INPUT -p tcp -s "$source" --dport "$port" -j ACCEPT 2>/dev/null; then
+        log_info "TCP port $port from $source already allowed (skipping)"
+        return 0
+    fi
+
     if [[ -n "$comment" ]]; then
         iptables -A INPUT -p tcp -s "$source" --dport "$port" -m comment --comment "$comment" -j ACCEPT
     else
         iptables -A INPUT -p tcp -s "$source" --dport "$port" -j ACCEPT
     fi
+
+    # Also allow on IPv6 (for any source)
+    if [[ "$source" == "0.0.0.0/0" ]]; then
+        ip6tables -A INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+
     log_info "Allowed TCP port $port from $source"
 }
 
@@ -161,31 +300,69 @@ allow_port_udp() {
     local source="${2:-0.0.0.0/0}"
     local comment="${3:-}"
 
+    if ! validate_port "$port"; then
+        return 1
+    fi
+
+    # Check if rule already exists (idempotency)
+    if iptables -C INPUT -p udp -s "$source" --dport "$port" -j ACCEPT 2>/dev/null; then
+        log_info "UDP port $port from $source already allowed (skipping)"
+        return 0
+    fi
+
     if [[ -n "$comment" ]]; then
         iptables -A INPUT -p udp -s "$source" --dport "$port" -m comment --comment "$comment" -j ACCEPT
     else
         iptables -A INPUT -p udp -s "$source" --dport "$port" -j ACCEPT
     fi
+
+    # Also allow on IPv6 (for any source)
+    if [[ "$source" == "0.0.0.0/0" ]]; then
+        ip6tables -A INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+
     log_info "Allowed UDP port $port from $source"
 }
 
 block_ip() {
     local ip="$1"
     local comment="${2:-Blocked}"
+
+    if ! validate_ip "$ip"; then
+        return 1
+    fi
+
+    # Check if rule already exists (idempotency)
+    if iptables -C INPUT -s "$ip" -j DROP 2>/dev/null; then
+        log_info "IP $ip already blocked (skipping)"
+        return 0
+    fi
+
     log_info "Blocking IP: $ip ($comment)..."
     iptables -I INPUT -s "$ip" -m comment --comment "$comment" -j DROP
 }
 
 allow_icmp_from() {
     local ip="$1"
+
+    if ! validate_ip "$ip"; then
+        return 1
+    fi
+
     log_info "Allowing ICMP from $ip..."
     iptables -A INPUT -p icmp -s "$ip" -j ACCEPT
 }
 
 create_fail2ban_chain() {
     local chain_name="$1"
-    log_info "Creating fail2ban chain: $chain_name..."
 
+    # Check if chain already exists (idempotency)
+    if iptables -L "$chain_name" -n >/dev/null 2>&1; then
+        log_info "Fail2ban chain $chain_name already exists (skipping)"
+        return 0
+    fi
+
+    log_info "Creating fail2ban chain: $chain_name..."
     iptables -N "$chain_name" 2>/dev/null || true
     iptables -A "$chain_name" -j RETURN
 }
@@ -211,22 +388,32 @@ setup_game_server_rules() {
 save_rules() {
     log_info "Saving firewall rules..."
 
+    # Ensure directory exists
+    mkdir -p /etc/iptables
+
     # Save using iptables-persistent
     if command -v netfilter-persistent &> /dev/null; then
         netfilter-persistent save
     else
         iptables-save > /etc/iptables/rules.v4
+        ip6tables-save > /etc/iptables/rules.v6
     fi
 
-    log_info "Rules saved to /etc/iptables/rules.v4"
+    log_info "Rules saved to /etc/iptables/rules.v4 and rules.v6"
 }
 
 show_rules() {
     echo ""
     echo "=================================================="
-    echo "Current Firewall Rules"
+    echo "Current Firewall Rules (IPv4)"
     echo "=================================================="
     iptables -L -n -v --line-numbers | head -50
+
+    echo ""
+    echo "=================================================="
+    echo "Current Firewall Rules (IPv6)"
+    echo "=================================================="
+    ip6tables -L -n -v --line-numbers | head -30
 }
 
 interactive_setup() {
@@ -236,17 +423,31 @@ interactive_setup() {
     echo ""
 
     # SSH Port
-    read -p "SSH Port [10022]: " input_ssh_port
-    SSH_PORT="${input_ssh_port:-10022}"
+    local input_ssh_port
+    while true; do
+        read -p "SSH Port [10022]: " input_ssh_port
+        SSH_PORT="${input_ssh_port:-10022}"
+        if validate_port "$SSH_PORT" 2>/dev/null; then
+            break
+        fi
+        echo "Please enter a valid port number (1-65535)"
+    done
 
     # Admin IP
     echo ""
-    read -p "Your admin IP address (full access): " ADMIN_IP
-
-    if [[ -z "$ADMIN_IP" ]]; then
-        log_error "Admin IP is required for safe firewall setup!"
-        exit 1
-    fi
+    local input_admin_ip
+    while true; do
+        read -p "Your admin IP address (full access): " input_admin_ip
+        if [[ -z "$input_admin_ip" ]]; then
+            log_error "Admin IP is required for safe firewall setup!"
+            continue
+        fi
+        if validate_ip "$input_admin_ip" 2>/dev/null; then
+            ADMIN_IP="$input_admin_ip"
+            break
+        fi
+        echo "Please enter a valid IPv4 address (e.g., 192.168.1.100)"
+    done
 
     # Confirm
     echo ""
@@ -262,6 +463,9 @@ interactive_setup() {
         log_warn "Aborted"
         exit 0
     fi
+
+    # Mark setup in progress for cleanup handler
+    SETUP_IN_PROGRESS=true
 
     # Apply rules
     flush_rules
@@ -283,12 +487,16 @@ ADMIN_IP="$ADMIN_IP"
 EOF
 
     save_rules
+
+    # Mark setup complete
+    SETUP_IN_PROGRESS=false
+
     show_rules
 
     echo ""
     echo -e "${GREEN}Firewall configured successfully!${NC}"
     echo ""
-    echo -e "${RED}WARNING:${NC} Default INPUT policy is DROP"
+    echo -e "${RED}WARNING:${NC} Default INPUT policy is DROP (IPv4 and IPv6)"
     echo "Your IP ($ADMIN_IP) has been whitelisted for full access."
     echo ""
 }
@@ -296,23 +504,43 @@ EOF
 # Quick commands
 cmd_allow_ip() {
     check_root
-    allow_admin_ip "$1" "${2:-Manual}"
+    if [[ -z "$1" ]]; then
+        log_error "IP address required"
+        exit 1
+    fi
+    if ! allow_admin_ip "$1" "${2:-Manual}"; then
+        exit 1
+    fi
     save_rules
 }
 
 cmd_block_ip() {
     check_root
-    block_ip "$1" "${2:-Manual block}"
+    if [[ -z "$1" ]]; then
+        log_error "IP address required"
+        exit 1
+    fi
+    if ! block_ip "$1" "${2:-Manual block}"; then
+        exit 1
+    fi
     save_rules
 }
 
 cmd_allow_port() {
     check_root
+    if [[ -z "$1" ]]; then
+        log_error "Port number required"
+        exit 1
+    fi
     local proto="${3:-tcp}"
     if [[ "$proto" == "udp" ]]; then
-        allow_port_udp "$1" "${2:-0.0.0.0/0}"
+        if ! allow_port_udp "$1" "${2:-0.0.0.0/0}"; then
+            exit 1
+        fi
     else
-        allow_port_tcp "$1" "${2:-0.0.0.0/0}"
+        if ! allow_port_tcp "$1" "${2:-0.0.0.0/0}"; then
+            exit 1
+        fi
     fi
     save_rules
 }
