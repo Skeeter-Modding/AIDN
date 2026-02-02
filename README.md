@@ -288,6 +288,7 @@ For attacks exceeding your bandwidth, consider:
 | **Path.net** | UDP games | Low latency, gaming focused |
 | **Hyperfilter** | Competitive | High-end game protection |
 
+For support go to discord.gg/triplethreat  and look for Skeeter
 ## License
 
 Apache 2.0 - See [LICENSE](LICENSE)
