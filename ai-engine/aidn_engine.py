@@ -36,8 +36,14 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
+# Local imports
+try:
+    from discord_notify import DiscordNotifier
+except ImportError:
+    from ai_engine.discord_notify import DiscordNotifier
+
 # Configuration
-CONFIG_PATH = "/etc/aidn/ai-engine.conf"
+CONFIG_PATH = "/etc/aidn/aidn.conf"
 DATA_PATH = "/var/lib/aidn"
 LOG_PATH = "/var/log/aidn"
 BPF_MAPS_PATH = "/sys/fs/bpf/aidn"
@@ -552,7 +558,9 @@ class AIDNEngine:
             'threats_detected': 0,
             'ips_blocked': 0,
             'ips_rate_limited': 0,
-            'false_positive_corrections': 0
+            'false_positive_corrections': 0,
+            'attacks_today': 0,
+            'start_time': None
         }
 
         # Event processing queue
@@ -561,7 +569,68 @@ class AIDNEngine:
         # BPF map file descriptors
         self.bpf_maps = {}
 
+        # Discord notifications
+        self.discord: Optional[DiscordNotifier] = None
+        self._init_discord()
+
         self._setup_signal_handlers()
+
+    def _init_discord(self):
+        """Initialize Discord webhook notifications"""
+        try:
+            config = self._load_config()
+            discord_config = config.get('discord', {})
+
+            if discord_config.get('enabled') and discord_config.get('webhook_url'):
+                self.discord = DiscordNotifier(
+                    webhook_url=discord_config['webhook_url'],
+                    server_name=discord_config.get('server_name', 'AIDN Server')
+                )
+                logger.info("Discord notifications enabled")
+            else:
+                logger.info("Discord notifications disabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Discord: {e}")
+
+    def _load_config(self) -> dict:
+        """Load configuration from file"""
+        config = {}
+        current_section = None
+
+        config_path = Path(CONFIG_PATH)
+        if not config_path.exists():
+            return config
+
+        try:
+            with open(config_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+
+                    if line.startswith('[') and line.endswith(']'):
+                        current_section = line[1:-1]
+                        config[current_section] = {}
+                    elif '=' in line and current_section:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+
+                        # Convert types
+                        if value.lower() in ('true', '1', 'yes'):
+                            value = True
+                        elif value.lower() in ('false', '0', 'no'):
+                            value = False
+                        elif value.isdigit():
+                            value = int(value)
+                        elif value.replace('.', '', 1).isdigit():
+                            value = float(value)
+
+                        config[current_section][key] = value
+        except Exception as e:
+            logger.warning(f"Failed to load config: {e}")
+
+        return config
 
     def _setup_signal_handlers(self):
         """Setup graceful shutdown handlers"""
@@ -572,6 +641,23 @@ class AIDNEngine:
         """Graceful shutdown"""
         logger.info("Shutting down AIDN Engine...")
         self.running = False
+
+        # Send Discord shutdown notification
+        if self.discord:
+            uptime = "Unknown"
+            if self.stats.get('start_time'):
+                delta = datetime.now() - self.stats['start_time']
+                hours, remainder = divmod(int(delta.total_seconds()), 3600)
+                minutes, _ = divmod(remainder, 60)
+                uptime = f"{hours}h {minutes}m"
+
+            self.discord.notify_system_status(
+                "shutdown",
+                f"AIDN protection stopped. Uptime: {uptime}. "
+                f"Blocked {self.stats['ips_blocked']} IPs during this session."
+            )
+            time.sleep(1)  # Give time for notification to send
+
         self.threat_intel.player_tracker.save_profiles()
         self.threat_intel.analyzer.save_model()
         sys.exit(0)
@@ -602,18 +688,38 @@ class AIDNEngine:
     def process_threat(self, assessment: ThreatAssessment):
         """Take action based on threat assessment"""
         ip = assessment.ip_address
+        reasons = ', '.join(assessment.reasons) if assessment.reasons else "Anomalous traffic"
 
         if assessment.recommended_action == "block":
             if assessment.confidence >= 0.9:  # Very high confidence required
                 self.update_xdp_blacklist(ip, 3600)  # 1 hour block
                 self.stats['ips_blocked'] += 1
-                logger.warning(f"BLOCKED {ip}: {', '.join(assessment.reasons)} "
+                self.stats['attacks_today'] += 1
+                logger.warning(f"BLOCKED {ip}: {reasons} "
                              f"(confidence: {assessment.confidence:.2f})")
+
+                # Send Discord notification
+                if self.discord:
+                    self.discord.notify_ip_blocked(
+                        ip=ip,
+                        reason=reasons,
+                        duration=3600,
+                        attack_type=assessment.threat_level,
+                        confidence=assessment.confidence
+                    )
             else:
                 # Not confident enough, just rate limit
                 logger.info(f"Would block {ip} but confidence too low "
                           f"({assessment.confidence:.2f}), rate limiting instead")
                 self.stats['ips_rate_limited'] += 1
+
+                # Notify about rate limiting
+                if self.discord:
+                    self.discord.notify_ip_rate_limited(
+                        ip=ip,
+                        current_pps=int(assessment.anomaly_score * 10000),
+                        limit_pps=10000
+                    )
 
         elif assessment.recommended_action == "rate_limit":
             self.stats['ips_rate_limited'] += 1
@@ -654,6 +760,14 @@ class AIDNEngine:
 
         logger.info("Learning phase complete, switching to protection mode")
 
+        # Notify Discord that learning is complete
+        if self.discord:
+            self.discord.notify_system_status(
+                "startup",
+                f"Learning phase complete! Collected {samples_collected} traffic samples. "
+                f"Now switching to **Protection Mode**. Your server is protected."
+            )
+
     def protection_loop(self):
         """
         Main protection loop: analyze traffic and take action
@@ -685,9 +799,20 @@ class AIDNEngine:
         Path(LOG_PATH).mkdir(parents=True, exist_ok=True)
 
         self.running = True
+        self.stats['start_time'] = datetime.now()
 
         # Open BPF maps
         self._open_bpf_maps()
+
+        # Send Discord startup notification
+        if self.discord:
+            is_learning = not self.threat_intel.analyzer.is_trained
+            mode = "Learning Mode" if is_learning else "Protection Mode"
+            self.discord.notify_system_status(
+                "startup" if not is_learning else "learning",
+                f"AIDN protection started in **{mode}**. "
+                f"Monitoring traffic and ready to defend against attacks."
+            )
 
         # Check if we need learning mode
         if not self.threat_intel.analyzer.is_trained:
