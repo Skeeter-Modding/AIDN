@@ -15,7 +15,9 @@ NC='\033[0m'
 # Paths
 F2B_JAIL_LOCAL="/etc/fail2ban/jail.local"
 F2B_FILTER_DIR="/etc/fail2ban/filter.d"
+F2B_JAIL_BACKUP=""
 
+# Logging functions (defined early for use in cleanup)
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -28,9 +30,68 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Cleanup handler for unexpected exits
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_error "Script failed with exit code $exit_code"
+        if [[ -n "$F2B_JAIL_BACKUP" ]] && [[ -f "$F2B_JAIL_BACKUP" ]]; then
+            log_warn "Restoring fail2ban configuration from backup..."
+            cp "$F2B_JAIL_BACKUP" "$F2B_JAIL_LOCAL" 2>/dev/null || true
+            systemctl restart fail2ban 2>/dev/null || true
+        fi
+    fi
+}
+trap cleanup EXIT
+
+# Input validation functions
+validate_ip() {
+    local ip="$1"
+    # Match IPv4 address with optional CIDR notation
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        log_error "Invalid IP address: $ip"
+        return 1
+    fi
+    # Validate each octet is 0-255
+    local IFS='.'
+    read -ra octets <<< "${ip%%/*}"
+    for octet in "${octets[@]}"; do
+        if [[ "$octet" -gt 255 ]]; then
+            log_error "Invalid IP address: $ip (octet $octet > 255)"
+            return 1
+        fi
+    done
+    return 0
+}
+
+validate_port() {
+    local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        log_error "Invalid port number: $port (must be 1-65535)"
+        return 1
+    fi
+    return 0
+}
+
+validate_jail() {
+    local jail="$1"
+    if ! fail2ban-client status "$jail" >/dev/null 2>&1; then
+        log_error "Jail '$jail' does not exist or fail2ban is not running"
+        return 1
+    fi
+    return 0
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "This script must be run as root"
+        exit 1
+    fi
+}
+
+check_fail2ban_installed() {
+    if ! command -v fail2ban-client &> /dev/null; then
+        log_error "fail2ban is not installed. Run '$0 setup' first."
         exit 1
     fi
 }
@@ -186,15 +247,23 @@ restart_fail2ban() {
     log_info "Restarting fail2ban..."
     systemctl restart fail2ban
 
-    sleep 2
+    # Wait for fail2ban to start with timeout (max 30 seconds)
+    local max_attempts=15
+    local attempt=0
 
-    if systemctl is-active --quiet fail2ban; then
-        log_info "Fail2ban restarted successfully"
-    else
-        log_error "Fail2ban failed to start!"
-        journalctl -u fail2ban -n 20
-        exit 1
-    fi
+    while [[ $attempt -lt $max_attempts ]]; do
+        sleep 2
+        if systemctl is-active --quiet fail2ban; then
+            log_info "Fail2ban restarted successfully"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        log_info "Waiting for fail2ban to start... (attempt $attempt/$max_attempts)"
+    done
+
+    log_error "Fail2ban failed to start within 30 seconds!"
+    journalctl -u fail2ban -n 20
+    exit 1
 }
 
 show_status() {
@@ -219,12 +288,32 @@ unban_ip() {
     local ip="$1"
     local jail="${2:-}"
 
+    if [[ -z "$ip" ]]; then
+        log_error "IP address required"
+        return 1
+    fi
+
+    if ! validate_ip "$ip"; then
+        return 1
+    fi
+
     if [[ -z "$jail" ]]; then
         log_info "Unbanning $ip from all jails..."
-        fail2ban-client unban "$ip" 2>/dev/null || true
+        if fail2ban-client unban "$ip" 2>/dev/null; then
+            log_info "Successfully unbanned $ip"
+        else
+            log_warn "IP $ip was not banned or already unbanned"
+        fi
     else
+        if ! validate_jail "$jail"; then
+            return 1
+        fi
         log_info "Unbanning $ip from $jail..."
-        fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null || true
+        if fail2ban-client set "$jail" unbanip "$ip" 2>/dev/null; then
+            log_info "Successfully unbanned $ip from $jail"
+        else
+            log_warn "IP $ip was not banned in $jail or already unbanned"
+        fi
     fi
 }
 
@@ -232,8 +321,26 @@ ban_ip() {
     local ip="$1"
     local jail="${2:-sshd}"
 
+    if [[ -z "$ip" ]]; then
+        log_error "IP address required"
+        return 1
+    fi
+
+    if ! validate_ip "$ip"; then
+        return 1
+    fi
+
+    if ! validate_jail "$jail"; then
+        return 1
+    fi
+
     log_info "Banning $ip in jail $jail..."
-    fail2ban-client set "$jail" banip "$ip"
+    if fail2ban-client set "$jail" banip "$ip"; then
+        log_info "Successfully banned $ip in $jail"
+    else
+        log_error "Failed to ban $ip in $jail"
+        return 1
+    fi
 }
 
 interactive_setup() {
@@ -242,19 +349,43 @@ interactive_setup() {
     echo "=============================================="
     echo ""
 
-    read -p "SSH Port [10022]: " ssh_port
-    ssh_port="${ssh_port:-10022}"
+    # SSH Port with validation
+    local ssh_port
+    while true; do
+        read -p "SSH Port [10022]: " ssh_port
+        ssh_port="${ssh_port:-10022}"
+        if validate_port "$ssh_port" 2>/dev/null; then
+            break
+        fi
+        echo "Please enter a valid port number (1-65535)"
+    done
 
-    read -p "Ban time in seconds [3600]: " ban_time
-    ban_time="${ban_time:-3600}"
+    # Ban time with validation
+    local ban_time
+    while true; do
+        read -p "Ban time in seconds [3600]: " ban_time
+        ban_time="${ban_time:-3600}"
+        if [[ "$ban_time" =~ ^[0-9]+$ ]] && [[ "$ban_time" -gt 0 ]]; then
+            break
+        fi
+        echo "Please enter a valid positive number"
+    done
 
-    read -p "Max retry attempts [3]: " max_retry
-    max_retry="${max_retry:-3}"
+    # Max retry with validation
+    local max_retry
+    while true; do
+        read -p "Max retry attempts [3]: " max_retry
+        max_retry="${max_retry:-3}"
+        if [[ "$max_retry" =~ ^[0-9]+$ ]] && [[ "$max_retry" -gt 0 ]]; then
+            break
+        fi
+        echo "Please enter a valid positive number"
+    done
 
     echo ""
     read -p "Setup Arma Reforger protection? [y/N]: " -n 1 -r
     echo
-    setup_arma="${REPLY}"
+    local setup_arma="${REPLY}"
 
     echo ""
     echo "Configuration:"
@@ -272,6 +403,14 @@ interactive_setup() {
     fi
 
     install_fail2ban
+
+    # Backup existing configuration if present
+    if [[ -f "$F2B_JAIL_LOCAL" ]]; then
+        F2B_JAIL_BACKUP="/etc/fail2ban/jail.local.backup.$(date +%Y%m%d%H%M%S)"
+        log_info "Backing up existing configuration to $F2B_JAIL_BACKUP"
+        cp "$F2B_JAIL_LOCAL" "$F2B_JAIL_BACKUP"
+    fi
+
     configure_jail_local "$ssh_port" "$ban_time" "600" "$max_retry"
     create_sshd_ddos_filter
 
@@ -315,15 +454,23 @@ main() {
             interactive_setup
             ;;
         status)
+            check_fail2ban_installed
             show_status
             ;;
         ban)
-            ban_ip "$2" "${3:-sshd}"
+            check_fail2ban_installed
+            if ! ban_ip "$2" "${3:-sshd}"; then
+                exit 1
+            fi
             ;;
         unban)
-            unban_ip "$2" "$3"
+            check_fail2ban_installed
+            if ! unban_ip "$2" "$3"; then
+                exit 1
+            fi
             ;;
         restart)
+            check_fail2ban_installed
             restart_fail2ban
             ;;
         *)
